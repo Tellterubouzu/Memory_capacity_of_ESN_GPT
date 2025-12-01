@@ -6,6 +6,7 @@ import math
 import os
 import random
 import time
+import wandb
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -308,8 +309,8 @@ class ESNLanguageModel(nn.Module):
         for attempt in range(max_retries):
             W = self._rand_sparse(shape, density, 1.0, device)
             W = self._scale_spectral_radius(W, spectral_radius)
-            #fro = torch.linalg.norm(W.to_dense(), ord="fro").item()
-            fro = torch.linalg.norm(W.values(), ord=2).item()
+            fro = torch.linalg.norm(W.to_dense(), ord="fro").item()
+            #fro = torch.linalg.norm(W.values(), ord=2).item()
             if fro < max_frobenius_norm:
                 return W, fro
         raise RuntimeError(
@@ -423,11 +424,14 @@ def train_model(
     max_epochs: int,
     patience: int,
     use_amp: bool,
+    wandb_run = None,
 ):
     model.train()
     best_val = float("inf")
     best_val_epoch = -1
     steps = 0
+    validation_epochs_every = 0
+    
     steps_per_epoch = math.ceil(len(train_loader.dataset) / train_loader.batch_size)
     loss_history = []
     for epoch in range(max_epochs):
@@ -446,19 +450,45 @@ def train_model(
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             steps += 1
-        val_loss = evaluate_loss(model, val_loader, device, use_amp)
-        if val_loss + 1e-6 < best_val:
-            best_val = val_loss
-            best_val_epoch = epoch
-        elif patience > 0 and (epoch - best_val_epoch) >= patience:
-            break
+            if wandb_run is not None:
+                wandb_run.log(
+                    {
+                        "train/loss_step": train_loss.item(),
+                        "train/step": steps,
+                        "train/epoch_float": epoch + steps / max(steps_per_epoch, 1),
+                    }
+                )
+            if steps % 500 == 0:
+                print(f"[log] Step {steps} Loss: {train_loss.item()}")
+        validation_epochs_every += 1
+        if epoch % validation_epochs_every == 0:
+            val_loss = evaluate_loss(model, val_loader, device, use_amp)
+            if val_loss + 1e-6 < best_val:
+                best_val = val_loss
+                best_val_epoch = epoch
+            elif patience > 0 and (epoch - best_val_epoch) >= patience:
+                break
         if steps >= max_steps:
             break
         if steps_per_epoch == 0:
             break
-    # train_loss = evaluate_loss(model, train_loader, device, use_amp)
+        
+    train_loss_full = evaluate_loss(model, train_loader, device, use_amp)
+    if wandb_run is not None:
+        wandb_run.log(
+            {
+                "train/loss_final": train_loss_full,
+                "val/loss_best": best_val,
+                "train/steps_total": steps,
+            }
+        )
+    print(f"train_loss_final: {train_loss_full}",
+        f"val_loss_best: {best_val}",
+        f"steps: {steps}",
+        f"loss_history: {loss_history}")
+    
     return {
-        "train_loss_final": loss_history[-1],
+        "train_loss_final": train_loss_full,
         "val_loss_best": best_val,
         "steps": steps,
         "loss_history": loss_history,
@@ -469,10 +499,17 @@ def train_model(
 # Experiment driver
 # =============================================================================
 GPT_SPECS = {
-    "S": {"n_layer": 2, "n_embd": 128, "n_head": 4},
-    "M": {"n_layer": 4, "n_embd": 256, "n_head": 4},
-    "L": {"n_layer": 4, "n_embd": 384, "n_head": 6},
-    "XL": {"n_layer": 8, "n_embd": 512, "n_head": 8},
+    "S": {"n_layer": 1, "n_embd": 64, "n_head": 4},
+    "M": {"n_layer": 2, "n_embd": 128, "n_head": 4},
+    "L": {"n_layer": 4, "n_embd": 128, "n_head": 4},
+    "XL": {"n_layer": 8, "n_embd": 256, "n_head": 8},
+}
+
+ESN_SPECS = {
+    "S":  {"d_embed": 64,  "reservoir_size":  276,  "r_out":  16,  "d_nonzero": 32},
+    "M":  {"d_embed": 128, "reservoir_size": 7456,  "r_out":  16,  "d_nonzero": 32},
+    "L":  {"d_embed": 128, "reservoir_size": 11276, "r_out":  32,  "d_nonzero": 32},
+    "XL": {"d_embed": 256, "reservoir_size": 20084, "r_out": 256,  "d_nonzero": 32},
 }
 
 DATASET_SIZES = [
@@ -523,7 +560,7 @@ def choose_esn_config(
 
     for res in reservoir_candidates:
         for r_out in r_out_candidates:
-            p_esn = count_esn_paramsƒ(
+            p_esn = count_esn_params(
                 vocab_size=vocab_size,
                 d_embed=d_embed,
                 reservoir_size=res,
@@ -730,22 +767,24 @@ def run_experiments(args):
         )
         gpt_model = GPT2LMHeadModel(gpt_config)
         gpt_param_counts[size_name] = count_gpt_params(gpt_model)
-        esn_choice = choose_esn_config(
-            target_params=gpt_param_counts[size_name],
+
+        esn_spec = ESN_SPECS[size_name]
+        p_esn = count_esn_params(
             vocab_size=vocab_size,
-            d_embed=cfg["n_embd"],
-            reservoir_candidates=args.reservoir_candidates,
-            r_out_candidates=args.r_out_candidates,
-            d=args.d_nonzero,
-            spectral_radius=args.spectral_radius,
-            sigma_in=args.sigma_in,
-            alpha_min=args.alpha_min,
-            alpha_max=args.alpha_max,
-            dropout=args.dropout,
-            device=torch.device("cpu"),
+            d_embed=esn_spec["d_embed"],
+            reservoir_size=esn_spec["reservoir_size"],
+            r_out=esn_spec["r_out"],
+            d=esn_spec["d_nonzero"],
         )
-        esn_choices[size_name] = esn_choice
-        esn_param_counts[size_name] = esn_choice["num_params"]
+        esn_cfg = {
+            "d_embed": esn_spec["d_embed"],
+            "reservoir_size": esn_spec["reservoir_size"],
+            "r_out": esn_spec["r_out"],
+            "d_nonzero": esn_spec["d_nonzero"],
+            "num_params": p_esn,
+        }
+        esn_choices[size_name] = esn_cfg
+        esn_param_counts[size_name] = p_esn
 
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(
@@ -773,9 +812,11 @@ def run_experiments(args):
     results_rows = []
     start_time = time.time()
     seeds = list(range(args.num_seeds))
-
-    for arch in ["GPT", "ESN"]:
-        for size_name, cfg in GPT_SPECS.items():
+    selected_sizes = args.sizes              # 例: ["S", "M"]
+    selected_archs = args.archs              # 例: ["GPT"] or ["ESN"] or ["GPT", "ESN"]
+    for arch in selected_archs:
+        for size_name in selected_sizes:
+            cfg = GPT_SPECS[size_name]
             for N in DATASET_SIZES:
                 for seed in seeds:
                     set_seed(seed)
@@ -813,13 +854,14 @@ def run_experiments(args):
                         ).to(device)
                         num_params = gpt_param_counts[size_name]
                         w_rec_fro_norm = None
+                        print(f"{cfg}")
                     else:
                         esn_cfg = esn_choices[size_name]
                         model = ESNLanguageModel(
                             vocab_size=vocab_size,
-                            d_embed=cfg["n_embd"],
+                            d_embed=esn_cfg["d_embed"],
                             reservoir_size=esn_cfg["reservoir_size"],
-                            d=args.d_nonzero,
+                            d=esn_cfg["d_nonzero"],
                             spectral_radius=args.spectral_radius,
                             sigma_in=args.sigma_in,
                             alpha_min=args.alpha_min,
@@ -828,16 +870,42 @@ def run_experiments(args):
                             r_out=esn_cfg["r_out"],
                             device=device,
                         )
-                        num_params = count_esn_params(vocab_size, d_embed, reservoir_size, r_out, d)
+                        num_params = esn_cfg["num_params"]
                         w_rec_fro_norm = model.W_rec_fro_norm
-
+                        print(
+                            f"{esn_cfg}"
+                        )
                     optimizer = torch.optim.Adam(
                         model.parameters(),
                         lr=args.lr,
                         betas=(0.9, 0.95),
                         weight_decay=args.weight_decay,
                     )
-
+                    if args.wandb:
+                        wandb_run = wandb.init(
+                            project="esn-data-efficiency", 
+                            name=f"{arch}-{size_name}-N{N}-seed{seed}",
+                            config={
+                                    "arch": arch,
+                                    "model_size": size_name,
+                                    "N": N,
+                                    "seed": seed,
+                                    "vocab_size": vocab_size,
+                                    "seq_len": seq_len,
+                                    "batch_size": args.batch_size,
+                                    "lr": args.lr,
+                                    "weight_decay": args.weight_decay,
+                                    "max_steps": args.max_steps,
+                                    "max_epochs": args.max_epochs,
+                                    "patience": args.patience,
+                                    "spectral_radius": args.spectral_radius,
+                                    "sigma_in": args.sigma_in,
+                                    "alpha_min": args.alpha_min,
+                                    "alpha_max": args.alpha_max,
+                                    "dropout": args.dropout,
+                                    "num_params": num_params,
+                                },
+                            )
                     train_stats = train_model(
                         model=model,
                         optimizer=optimizer,
@@ -848,6 +916,7 @@ def run_experiments(args):
                         max_epochs=args.max_epochs,
                         patience=args.patience,
                         use_amp=use_amp,
+                        wandb_run=wandb_run,
                     )
                     test_loss = evaluate_loss(model, test_loader, device, use_amp)
 
@@ -856,7 +925,18 @@ def run_experiments(args):
                         train_stats["train_loss_final"], total_tokens, vocab_size
                     )
                     bpp = total_mem_bits / num_params if num_params > 0 else float("nan")
-
+                    if args.wandb:
+                        wandb_run.log(
+                            {
+                                "test/loss": test_loss,
+                                "metrics/total_tokens": total_tokens,
+                                "metrics/total_data_bits": total_data_bits,
+                                "metrics/total_code_bits": total_code_bits,
+                                "metrics/total_mem_bits": total_mem_bits,
+                                "metrics/bpp": bpp,
+                            }
+                        )
+                        wandb_run.finish()
                     row = {
                         "arch": arch,
                         "model_size": size_name,
@@ -914,12 +994,12 @@ def parse_args():
     )
     parser.add_argument("--vocab-size", type=int, default=2048)
     parser.add_argument("--seq-len", type=int, default=65)
-    parser.add_argument("--batch-size", type=int, default=2048)
+    parser.add_argument("--batch-size", type=int, default=4096)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--max-steps", type=int, default=1_000_000)
     parser.add_argument("--max-epochs", type=int, default=5_000_000)
-    parser.add_argument("--patience", type=int, default=5)
+    parser.add_argument("--patience", type=int, default=0)
     parser.add_argument("--num-seeds", type=int, default=5)
     parser.add_argument("--eval-samples", type=int, default=10_000)
     parser.add_argument("--d-nonzero", type=int, default=32)
@@ -927,18 +1007,23 @@ def parse_args():
     parser.add_argument("--sigma-in", type=float, default=1.0)
     parser.add_argument("--alpha-min", type=float, default=0.0)
     parser.add_argument("--alpha-max", type=float, default=1.0)
-    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--wandb", type=bool, default=False)
     parser.add_argument(
-        "--reservoir-candidates",
-        type=int,
+        "--sizes",
+        type=str,
         nargs="+",
-        default=[1024, 2048, 4096, 8192, 16384],
+        choices=["S", "M", "L", "XL"],
+        default=["S", "M", "L"],
+        help="どのモデルサイズを走らせるか（複数指定可）",
     )
     parser.add_argument(
-        "--r-out-candidates",
-        type=int,
+        "--archs",
+        type=str,
         nargs="+",
-        default=[64, 128, 256, 512],
+        choices=["GPT", "ESN"],
+        default=["GPT", "ESN"],
+        help="実行するアーキテクチャ: GPT, ESN, または両方を空白区切りで指定",
     )
     parser.add_argument(
         "--output-dir",
@@ -947,6 +1032,11 @@ def parse_args():
     )
     return parser.parse_args()
 
-
 if __name__ == "__main__":
-    run_experiments(parse_args())
+    args = parse_args()
+    print("=== Parsed args ===")
+    for k, v in vars(args).items():
+        print(f"{k:15s}: {v}")
+    print("====================")
+
+    run_experiments(args)
