@@ -1,0 +1,2 @@
+arch,model_size,num_params,N,seed,train_loss_final,val_loss_best,test_loss_final,total_tokens,total_data_bits,total_code_bits,total_mem_bits,bpp,W_rec_fro_norm,steps
+ESN,S,181184,65536,0,7.634044587612152,7.64362636642456,7.700875914001465,4194304,46137344.0,46194379.27185057,0.0,0.0,17.179824829101562,500000
