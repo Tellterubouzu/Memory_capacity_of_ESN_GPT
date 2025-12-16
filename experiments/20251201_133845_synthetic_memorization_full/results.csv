@@ -1,0 +1,1 @@
+arch,model_size,num_params,N,seed,train_loss_final,val_loss_best,test_loss_final,total_tokens,total_data_bits,total_code_bits,total_mem_bits,bpp,W_rec_fro_norm,steps
